@@ -1,0 +1,32 @@
+[package]
+name = "bi_glow"
+version = "0.1.0"
+edition = "2021"
+authors = ["Thembinkosi Mkhonta <thembinkosimkhonta01@gmail.com>"]
+include = ["LICENSE-APACHE", "LICENSE-MIT", "**/*.rs", "Cargo.toml"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "wasm32-unknown-unknown"]
+
+[dependencies]
+egui = "0.30.0"
+egui_glow = "0.31.0"
+nalgebra = "0.33.2"
+noise = "0.9.0"
+rand = "0.9.0"
+eframe = { version = "0.30", default-features = false, features = [
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+    "persistence",   # Enable restoring app state when restarting the app.
+    "wayland",       # To support Linux (and CI)
+] }
+
+# web:
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3.70"               # to access the DOM (to hide the loading text)
+
+# Optimize all dependencies even in debug builds:
+[profile.dev.package."*"]
+opt-level = 2
