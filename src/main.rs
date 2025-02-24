@@ -10,12 +10,13 @@ use nalgebra as na;
 use noise::{NoiseFn, OpenSimplex};
 use rand::{random, rng, Rng};
 
-const REPRODUCING_INTERVAL: f32 = 10.0; // Every 10 seconds
+const REPRODUCING_INTERVAL: f32 = 10.0; // Every 2 seconds
+const HEALTH_DECAY_RATE: f32 = 0.0001; // decay rate at (0.01% per second)
 const SPHERE_SEGMENTS: usize = 16; // 3D sphere rendering
-const NODE_SEPARATION_FORCE: f32 = 2.0; // force to keep nodes apart
+const NODE_SEPARATION_FORCE: f32 = 1.0; // force to keep nodes apart
 const MAX_REPRODUCING_ATTEMPTS: u32 = 3000; // Maximum number of times a node can reproduce
-const HEALTH_DECAY_RATE: f32 = 0.1; // Health reduction per second
-const HALF_LIFE: f32 = 100000000000.0; // Seconds until health is halved
+                                            // const HEALTH_DECAY_RATE: f32 = 0.1; // Health reduction per second
+const HALF_LIFE: f32 = 1_000_000_.0; // Seconds until health is halved
 
 pub const HASHMAP_DIRECT_LOOKUP: &str = "HashMap Direct Lookup";
 pub const LINEAR_SEARCH: &str = "Linear Search";
@@ -63,7 +64,7 @@ enum SearchAlgorithm {
     //    - Cons: More complex, uses more memory
     BFS,
 
-    // DSP, // TODO: documentation
+    DSP, // TODO: documentation
 
     // Comparison for all algos
     CompareAll,
@@ -93,14 +94,16 @@ impl PartialOrd for State {
 // NodeProperties holds the properties for each node
 // it has the following properties
 #[derive(Clone)]
+#[allow(dead_code)]
 struct NodeProperties {
-    color: [f32; 3],   // color of the node
-    size: f32,         // size of the node
-    strength: f32,     // strength the node possesses
-    health: f32,       // Current health of the node
-    half_life: f32,    // Time until health is halved
-    reproduction: u32, // Number of times this node has reproduced
-    generation: u32,   // Which generation this node belongs to
+    color: [f32; 3],      // color of the node
+    size: f32,            // size of the node
+    strength: f32,        // strength the node possesses
+    health: f32,          // Current health of the node
+    half_life: f32,       // Time until health is halved
+    reproduction: u32,    // Number of times this node has reproduced
+    generation: u32,      // Which generation this node belongs to
+    learning_factor: f32, // preference for pairing with high-quality nodes (0.0 to 1.0)
 }
 
 // Node defines the structure of a single node in the system
@@ -127,6 +130,11 @@ struct SynapticWeb {
     view: View,
     selected_node: Option<usize>,
     last_reproduce_time: Instant,
+    highlighted_path: Option<(Vec<usize>, Color32)>,
+    search_id: String,
+    search_results: Vec<SearchMetrics>,
+    selected_algo: SearchAlgorithm,
+    avg_health_history: Vec<(f32, f32)>, //(time, avg_health) for evolution training
 }
 
 // View structure for 3D navigation
@@ -145,6 +153,11 @@ impl SynapticWeb {
             view: View::default(),
             selected_node: None,
             last_reproduce_time: Instant::now(),
+            highlighted_path: None,
+            search_id: String::new(),
+            search_results: Vec::new(),
+            selected_algo: SearchAlgorithm::HashMap,
+            avg_health_history: Vec::new(),
         };
 
         // creation of the initial parent node (world inception) and addition of the initial children from the parent
@@ -157,6 +170,22 @@ impl SynapticWeb {
 
     // draw_3d_node is used to draw the shapes of the nodes on the ecosystem
     fn draw_3d_node(&self, painter: &Painter, center: Pos2, radius: f32, color: Color32) {
+        let node = self.nodes.values().next().unwrap();
+
+        let base_color = Color32::from_rgb(
+            (node.properties.color[0] * 255.0) as u8,
+            (node.properties.color[1] * 255.0) as u8,
+            (node.properties.color[2] * 255.0) as u8,
+        );
+
+        let dead_color = Color32::GRAY;
+        let health = node.properties.health;
+        let effective_color = Color32::from_rgb(
+            (base_color.r() as f32 * health + dead_color.r() as f32 * (1.0 - health)) as u8,
+            (base_color.g() as f32 * health + dead_color.g() as f32 * (1.0 - health)) as u8,
+            (base_color.b() as f32 * health + dead_color.b() as f32 * (1.0 - health)) as u8,
+        );
+
         let mut points = Vec::new();
 
         // Generating sphere points
@@ -189,7 +218,7 @@ impl SynapticWeb {
         painter.circle_filled(
             center,
             radius,
-            color.linear_multiply(0.9), // Slightly darker for 3D effect
+            effective_color.linear_multiply(0.9), // Slightly darker for 3D effect
         );
     }
 
@@ -224,6 +253,7 @@ impl SynapticWeb {
                 half_life: HALF_LIFE,
                 reproduction: 0,
                 generation: 0, // Root node is generation 0
+                learning_factor: 0.5,
             },
             parents: None,
         };
@@ -251,6 +281,7 @@ impl SynapticWeb {
                     half_life: HALF_LIFE,
                     reproduction: 0,
                     generation: 1, // first generation of nodes
+                    learning_factor: 0.5,
                 },
                 parents: Some((0, 0)), // Both has inception node as parent
             };
@@ -327,17 +358,6 @@ impl SynapticWeb {
         }
     }
 
-    // fn handle_node_click(&mut self, clicked_id: usize) {
-    //     self.selected_node = Some(clicked_id);
-
-    //     // Searching and Highlighting pattern
-    //     if let Some(start_node) = self.nodes.get(&0){
-    //         let (path, metrics) = self.find_path_to_node(0, clicked_id);
-    //         self.highlightened_path = Some(path);
-    //         self.search_metrics = Some(metrics);
-    //     }
-    // }
-
     fn update(&mut self) {
         // Storing IDs of nodes that will be removed from the system once they have double the half life
         let dead_nodes: Vec<usize> = self
@@ -354,23 +374,39 @@ impl SynapticWeb {
 
         self.nodes.retain(|_, node| node.properties.health > 0.0);
 
-        // Update health of all nodes
-        // for node in self.nodes.values_mut() { // TODO: health decay
-        //     // Calculate health decay based on half-life
-        //     node.properties.health *= 1.0 - HEALTH_DECAY_RATE * 0.016; // 0.016 is roughly one frame at 60fps
-        // }
+        // Update health of all nodes with slow decay
+        for node in self.nodes.values_mut() {
+            node.properties.health *= 1.0 - HEALTH_DECAY_RATE * 0.016; // 0.016 is roughly one frame at 60fps
+            node.properties.health = node.properties.health.max(0.0);
+        }
 
-        // Check environmental conditions for breeding
+        // Track average health for evolution
+        let avg_health: f32 = self
+            .nodes
+            .values()
+            .map(|n| n.properties.health)
+            .sum::<f32>()
+            / self.nodes.len() as f32;
+        let time = Instant::now()
+            .duration_since(self.last_reproduce_time)
+            .as_secs_f32();
+        self.avg_health_history.push((time, avg_health));
+        if self.avg_health_history.len() > 1000 {
+            // Limit history
+            self.avg_health_history.remove(0);
+        }
+
+        // Check environmental conditions for reproduction
         let current_population = self.nodes.len();
         let ideal_population = 10000000;
 
         if current_population < ideal_population {
-            // More favorable breeding conditions
+            // More favorable reproduction conditions
             if self.last_reproduce_time.elapsed().as_secs_f32() >= REPRODUCING_INTERVAL * 0.5 {
                 self.attempt_reproducing();
             }
         } else {
-            // Less favorable breeding conditions
+            // Less favorable reproduction conditions
             if self.last_reproduce_time.elapsed().as_secs_f32() >= REPRODUCING_INTERVAL * 1.5 {
                 self.attempt_reproducing();
             }
@@ -441,27 +477,119 @@ impl SynapticWeb {
         }
     }
 
+    /// Nodes are sorted by a quality metric (70% health, 30% strength).
+    /// High-quality nodes pair within their tier, low-quality within theirs, and average nodes use learning_factor to bias toward similar quality (with some randomness).
+    /// learning_factor adjusts based on child health, introducing a learning sense.
     fn attempt_reproducing(&mut self) {
-        let node_ids: Vec<usize> = self.nodes.keys().filter(|&&id| id != 0).copied().collect(); // this excludes node 0 from participating
+        if self.last_reproduce_time.elapsed().as_secs_f32() < REPRODUCING_INTERVAL {
+            return;
+        }
 
-        if node_ids.len() >= 2 {
-            // TODO: generation of new nodes is random. We need to add a factor here/controlled way of reproducing
-            let mut rng = rng();
-            let parent1_idx = rng.random_range(0..node_ids.len());
-            let parent2_idx = rng.random_range(0..node_ids.len());
-            let parent1 = node_ids[parent1_idx];
-            let parent2 = node_ids[parent2_idx];
+        let node_ids: Vec<usize> = self.nodes.keys().filter(|&&id| id != 0).copied().collect();
+        if node_ids.len() < 2 {
+            return;
+        }
 
-            // Check if parents can still reproduce based on the number of previous reproductions
-            if let (Some(p1), Some(p2)) = (self.nodes.get(&parent1), self.nodes.get(&parent2)) {
-                if p1.properties.reproduction < MAX_REPRODUCING_ATTEMPTS
-                    && p2.properties.reproduction < MAX_REPRODUCING_ATTEMPTS
-                    && parent1 != parent2
+        // Step 1: Compute quality scores
+        let mut nodes_with_quality: Vec<(usize, f32)> = node_ids
+            .iter()
+            .map(|&id| {
+                let node = self.nodes.get(&id).unwrap();
+                let quality = 0.7 * node.properties.health + 0.3 * node.properties.strength;
+                (id, quality)
+            })
+            .collect();
+        nodes_with_quality.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Step 2: Determine tiers
+        let count = nodes_with_quality.len();
+        let high_cutoff = count / 4;
+        let low_cutoff = count - count / 4;
+
+        // Step 3: Collect pairs to reproduce
+        let mut rng = rand::rng();
+        let mut pairs_to_reproduce = Vec::new();
+
+        for i in 0..count {
+            let (id1, q1) = nodes_with_quality[i];
+            let node1 = self.nodes.get(&id1).unwrap();
+            if node1.properties.reproduction >= MAX_REPRODUCING_ATTEMPTS {
+                continue;
+            }
+
+            let mut partner_id = None;
+            if i < high_cutoff {
+                let candidates = &nodes_with_quality[0..high_cutoff];
+                partner_id = candidates
+                    .iter()
+                    .filter(|&&(id, _)| id != id1)
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .map(|&(id, _)| id);
+            } else if i >= low_cutoff {
+                let candidates = &nodes_with_quality[low_cutoff..];
+                partner_id = candidates
+                    .iter()
+                    .filter(|&&(id, _)| id != id1)
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .map(|&(id, _)| id);
+            } else {
+                let lf = node1.properties.learning_factor;
+                let candidates = &nodes_with_quality[high_cutoff..low_cutoff];
+                partner_id = candidates
+                    .iter()
+                    .filter(|&&(id, _)| id != id1)
+                    .max_by(|a, b| {
+                        let diff_a = (a.1 - q1).abs();
+                        let diff_b = (b.1 - q1).abs();
+                        let score_a = if rng.random::<f32>() < lf {
+                            diff_a
+                        } else {
+                            -diff_a
+                        };
+                        let score_b = if rng.random::<f32>() < lf {
+                            diff_b
+                        } else {
+                            -diff_b
+                        };
+                        score_a.partial_cmp(&score_b).unwrap()
+                    })
+                    .map(|&(id, _)| id);
+            }
+
+            if let Some(id2) = partner_id {
+                pairs_to_reproduce.push((id1, id2));
+            }
+        }
+
+        // Step 4: Process reproduction and learning
+        for (id1, id2) in pairs_to_reproduce {
+            if let Some(child_id) = self.reproduce_nodes(id1, id2) {
+                let child_health = self.nodes.get(&child_id).unwrap().properties.health;
+
                 {
-                    self.reproduce_nodes(parent1, parent2);
+                    let parent1 = self.nodes.get_mut(&id1).unwrap();
+                    if child_health > 0.5 {
+                        parent1.properties.learning_factor =
+                            (parent1.properties.learning_factor + 0.1).min(1.0);
+                    } else {
+                        parent1.properties.learning_factor =
+                            (parent1.properties.learning_factor - 0.1).max(0.0);
+                    }
+                }
+
+                {
+                    let parent2 = self.nodes.get_mut(&id2).unwrap();
+                    if child_health > 0.5 {
+                        parent2.properties.learning_factor =
+                            (parent2.properties.learning_factor + 0.1).min(1.0);
+                    } else {
+                        parent2.properties.learning_factor =
+                            (parent2.properties.learning_factor - 0.1).max(0.0);
+                    }
                 }
             }
         }
+
         self.last_reproduce_time = Instant::now();
     }
 
@@ -495,12 +623,14 @@ impl SynapticWeb {
         let p1_props = {
             let parent1 = self.nodes.get_mut(&parent1_id)?;
             parent1.properties.reproduction += 1;
+            parent1.properties.health *= 0.95;
             parent1.properties.clone()
         };
 
         let p2_props = {
             let parent2 = self.nodes.get_mut(&parent2_id)?;
             parent2.properties.reproduction += 1;
+            parent2.properties.health *= 0.95;
             parent2.properties.clone()
         };
 
@@ -511,6 +641,10 @@ impl SynapticWeb {
         // TODO: can different generations create a child node?
         let generation = std::cmp::max(p1_props.generation, p2_props.generation) + 1;
 
+        let avg_health = (p1_props.health + p2_props.health) / 2.0;
+        let healt_variation = rand::random::<f32>() * 0.4 - 0.2;
+        let child_health = (avg_health + healt_variation).clamp(0.1, 1.0);
+
         // Creating child properties based on the parent properties
         let child_properties = NodeProperties {
             color: [
@@ -520,10 +654,11 @@ impl SynapticWeb {
             ],
             size: (p1_props.size + p2_props.size) / 2.0,
             strength: (p1_props.strength + p2_props.strength) / 2.0,
-            health: 1.0,
+            health: child_health,
             half_life: HALF_LIFE,
             reproduction: 0,
             generation,
+            learning_factor: 0.5,
         };
 
         // Calculate position between parents with slight offset
@@ -539,12 +674,6 @@ impl SynapticWeb {
             radius * random_angle.sin() * random_z_angle.sin(),
             radius * random_z_angle.cos(),
         );
-
-        // let offset = na::Vector3::new(
-        //     random::<f32>() - 0.5,
-        //     random::<f32>() - 0.5,
-        //     random::<f32>() - 0.5,
-        // ) * 0.5;
 
         let child = Node {
             id: self.next_id,
@@ -653,11 +782,11 @@ impl SynapticWeb {
         )
     }
 
-    fn _find_shortest_path_using_dsp(
-        &self,
+    fn search_node_using_dsp(
+        &mut self,
         start: usize,
         end: usize,
-    ) -> (Option<Vec<usize>>, SearchMetrics) {
+    ) -> (Option<&Node>, SearchMetrics) {
         let start_time = Instant::now();
         let mut comparisons = 0;
 
@@ -687,8 +816,11 @@ impl SynapticWeb {
                     current = previous;
                 }
 
+                path.reverse(); // path from start to end
+                self.highlighted_path = Some((path, Color32::from_rgb(255, 215, 0))); // Gold color
+
                 return (
-                    Some(path),
+                    self.nodes.get(&end),
                     SearchMetrics {
                         algorithm: DSP.to_string(),
                         comparisons,
@@ -857,6 +989,7 @@ impl eframe::App for SynapticWeb {
             }
 
             // First pass: Draw connections
+            // First pass: Draw connections
             for node in self.nodes.values() {
                 if let Some((parent1_id, parent2_id)) = node.parents {
                     if let (Some(parent1), Some(parent2)) =
@@ -879,14 +1012,29 @@ impl eframe::App for SynapticWeb {
                         let screen_parent2 = painter.clip_rect().center()
                             + vec2(parent2_pos.x, parent2_pos.y) * 100.0;
 
-                        // Draw surface-to-surface connections
+                        let connection_color =
+                            if let Some((ref path, color)) = self.highlighted_path {
+                                // Check if this connection is in the path (parent1 -> node or parent2 -> node)
+                                let in_path = path.windows(2).any(|w| {
+                                    (w[0] == parent1_id && w[1] == node.id)
+                                        || (w[0] == parent2_id && w[1] == node.id)
+                                });
+                                if in_path {
+                                    color
+                                } else {
+                                    Color32::GRAY
+                                }
+                            } else {
+                                Color32::GRAY
+                            };
+
                         self.surface_to_surface_connection(
                             &painter,
                             screen_child,
                             screen_parent1,
                             node.properties.size * 20.0,
                             parent1.properties.size * 20.0,
-                            Color32::GRAY,
+                            connection_color,
                         );
                         self.surface_to_surface_connection(
                             &painter,
@@ -894,7 +1042,7 @@ impl eframe::App for SynapticWeb {
                             screen_parent2,
                             node.properties.size * 20.0,
                             parent2.properties.size * 20.0,
-                            Color32::GRAY,
+                            connection_color,
                         );
                     }
                 }
@@ -946,84 +1094,85 @@ impl eframe::App for SynapticWeb {
             }
         });
 
+        egui::Window::new("Network Analysis").show(ctx, |ui| {
+            let avg_degree = self.nodes.values().filter_map(|n| n.parents).count() as f32 * 2.0
+                / self.nodes.len() as f32;
+            ui.label(format!("Average Degree: {:.2}", avg_degree));
+            if ui.button("Find Central Node").clicked() {
+                let central_id = self
+                    .nodes
+                    .iter()
+                    .max_by_key(|(_, n)| {
+                        self.nodes
+                            .iter()
+                            .filter(|(_, m)| {
+                                m.parents.map_or(false, |(p1, p2)| p1 == n.id || p2 == n.id)
+                            })
+                            .count()
+                    })
+                    .map(|(&id, _)| id);
+                self.selected_node = central_id;
+            }
+        });
+
         egui::Window::new("Search Node").show(ctx, |ui| {
-            let mut search_id: String = String::new();
-            let mut selected_algo: SearchAlgorithm = SearchAlgorithm::HashMap;
-            let mut search_results: Vec<SearchMetrics> = Vec::new();
+            // let mut search_id: String = String::new();
+            // let mut selected_algo: SearchAlgorithm = SearchAlgorithm::HashMap;
+            // let mut search_results: Vec<SearchMetrics> = Vec::new();
 
             ui.horizontal(|ui| {
                 ui.label("Search Algorithm:");
-                ui.radio_value(&mut selected_algo, SearchAlgorithm::HashMap, "HashMap");
-                ui.radio_value(&mut selected_algo, SearchAlgorithm::Linear, "Linear");
-                ui.radio_value(&mut selected_algo, SearchAlgorithm::BFS, "BFS");
+                ui.radio_value(&mut self.selected_algo, SearchAlgorithm::HashMap, "HashMap");
+                ui.radio_value(&mut self.selected_algo, SearchAlgorithm::Linear, "Linear");
+                ui.radio_value(&mut self.selected_algo, SearchAlgorithm::BFS, "BFS");
+                ui.radio_value(&mut self.selected_algo, SearchAlgorithm::DSP, "DSP");
                 ui.radio_value(
-                    &mut selected_algo,
+                    &mut self.selected_algo,
                     SearchAlgorithm::CompareAll,
                     "Compare All",
                 );
             });
 
             ui.horizontal(|ui| {
-                let _text_edit = ui.text_edit_singleline(&mut search_id);
+                let _text_edit = ui.text_edit_singleline(&mut self.search_id);
                 if ui.button("Search").clicked() {
-                    if let Ok(id) = search_id.parse::<usize>() {
-                        search_results.clear();
-                        match selected_algo {
+                    if let Ok(id) = self.search_id.parse::<usize>() {
+                        self.search_results.clear();
+                        match self.selected_algo {
                             SearchAlgorithm::HashMap => {
                                 let (_, metrics) = self.search_node_using_hashmap(id);
-                                search_results.push(metrics);
+                                self.search_results.push(metrics);
                             }
                             SearchAlgorithm::Linear => {
                                 let (_, metrics) = self.search_node_using_linear(id);
-                                search_results.push(metrics);
+                                self.search_results.push(metrics);
                             }
                             SearchAlgorithm::BFS => {
                                 let (_, metrics) = self.search_node_using_bfs(id);
-                                search_results.push(metrics);
+                                self.search_results.push(metrics);
                             }
-                            // SearchAlgorithm::DSP => {
-                            //     if let Some(selected_id) = self.selected_node {
-                            //         egui::Window::new(format!("Node #{}", selected_id)).show(
-                            //             ctx,
-                            //             |ui| {
-                            //                 if ui
-                            //                     .button("Find Shortest Path from Root")
-                            //                     .clicked()
-                            //                 {
-                            //                     let (path, metrics) =
-                            //                         self.find_shortest_path(0, selected_id);
-                            //                     // if let Some(path) = path {
-                            //                     //     self.highlighted_path =
-                            //                     //         Some(HighlightedPath {
-                            //                     //             nodes: path,
-                            //                     //             color: Color32::from_rgb(
-                            //                     //                 255, 215, 0,
-                            //                     //             ),
-                            //                     //             timestamp: Instant::now(),
-                            //                     //         });
-                            //                     //     self.search_metrics = Some(metrics);
-                            //                     // }
-                            //                 }
-                            //             },
-                            //         );
-                            //     }
-                            // }
+                            SearchAlgorithm::DSP => {
+                                let (_, metrics) = self.search_node_using_dsp(0, id);
+                                self.search_results.push(metrics);
+                            }
                             SearchAlgorithm::CompareAll => {
                                 let (_, m1) = self.search_node_using_hashmap(id);
                                 let (_, m2) = self.search_node_using_linear(id);
                                 let (_, m3) = self.search_node_using_bfs(id);
-                                search_results.extend(vec![m1, m2, m3]);
+                                let (_, m4) = self.search_node_using_dsp(0, id);
+                                self.search_results.extend(vec![m1, m2, m3, m4]);
                             }
                         }
+                        self.search_id.clear();
                     }
                 }
             });
 
-            if !search_results.is_empty() {
+            if !self.search_results.is_empty() {
                 ui.separator();
                 ui.heading("Search Results");
 
-                for metrics in &search_results {
+                for metrics in &self.search_results {
                     ui.group(|ui| {
                         ui.label(format!("Algorithm: {}", metrics.algorithm));
                         ui.label(format!("Comparisons: {}", metrics.comparisons));
